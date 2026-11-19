@@ -14,6 +14,10 @@ user32.GetDC.restype = wintypes.HDC
 user32.GetDC.argtypes = [wintypes.HWND]
 user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
 user32.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
+user32.GetDesktopWindow.restype = wintypes.HWND
+user32.IsWindow.argtypes = [wintypes.HWND]
+user32.EnumChildWindows.argtypes = [wintypes.HWND, ctypes.c_void_p, wintypes.LPARAM]
+user32.EnumChildWindows.restype = wintypes.BOOL
 
 gdi32.CreateCompatibleDC.restype = wintypes.HDC
 gdi32.CreateCompatibleDC.argtypes = [wintypes.HDC]
@@ -188,6 +192,10 @@ def is_our_window(hwnd: int) -> bool:
     return user32.GetParent(hwnd) != 0
 
 
+def is_window(hwnd: int) -> bool:
+    return bool(user32.IsWindow(hwnd))
+
+
 def wallpaper_path() -> str | None:
     override = os.environ.get("LGS_WALLPAPER")
     if override and os.path.exists(override):
@@ -263,8 +271,8 @@ def capture_desktop_region(x: int, y: int, w: int, h: int):
 
 def find_live_wallpaper_window(x: int, y: int) -> int:
     """Find a Wallpaper Engine surface that covers the given screen point."""
-    progman = user32.FindWindowW("Progman", None)
-    if not progman:
+    desktop = user32.GetDesktopWindow()
+    if not desktop:
         return 0
 
     found = []
@@ -283,7 +291,10 @@ def find_live_wallpaper_window(x: int, y: int) -> int:
             found.append((w * h, hwnd))
         return True
 
-    user32.EnumChildWindows(progman, cb, 0)
+    # EnumChildWindows on the desktop walks every top-level window and all of
+    # its descendants, which covers both the Windows 11 layout (WPE under
+    # Progman) and Windows 10 (WPE under a top-level WorkerW).
+    user32.EnumChildWindows(desktop, ctypes.cast(cb, ctypes.c_void_p), 0)
     if not found:
         return 0
     found.sort()

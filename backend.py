@@ -109,6 +109,8 @@ class Backend(QObject):
         self._backdrop_rev = 0
         self._backdrop_source = ""
         self._backdrop_logged = ""
+        self._wp_hwnd = 0
+        self._wp_retry = 0.0
         self._last_capture = 0.0
         self._locked = bool(self._cfg.get("locked", False))
         self._autostart = config.autostart_enabled()
@@ -438,6 +440,8 @@ class Backend(QObject):
         self._wp_x, self._wp_y = x, y
         self._wp_w, self._wp_h = w, h
         self._dpr = dpr or 1.0
+        self._wp_hwnd = 0
+        self._wp_retry = 0.0
         self.refresh_backdrop()
 
     @Slot()
@@ -506,37 +510,69 @@ class Backend(QObject):
         screen = self._window.screen()
         dpr = screen.devicePixelRatio() or 1.0
         pad = int(BACKDROP_PAD * dpr)
+        wx = int(self._win_x * dpr)
+        wy = int(self._win_y * dpr)
+        ww = int(w * dpr)
+        wh = int(h * dpr)
 
-        hwnd = winutil.find_live_wallpaper_window(
-            int((self._win_x + w // 2) * dpr),
-            int((self._win_y + h // 2) * dpr),
-        )
+        def clamp_region(left, top, width, height):
+            x0 = max(wx - pad, left)
+            y0 = max(wy - pad, top)
+            x1 = min(wx + ww + pad, left + width)
+            y1 = min(wy + wh + pad, top + height)
+            if x1 - x0 < 8 or y1 - y0 < 8:
+                return None
+            return x0, y0, x1 - x0, y1 - y0
+
+        now = time.monotonic()
+        hwnd = self._wp_hwnd
+        if hwnd and not winutil.is_window(hwnd):
+            hwnd = 0
+            self._wp_hwnd = 0
         if hwnd:
-            img = winutil.capture_window_region(
-                hwnd,
-                int((self._win_x - BACKDROP_PAD) * dpr),
-                int((self._win_y - BACKDROP_PAD) * dpr),
-                int((w + BACKDROP_PAD * 2) * dpr),
-                int((h + BACKDROP_PAD * 2) * dpr),
-            )
-            if img is not None and not img.isNull() and not _is_black(img):
-                self._backdrop_source = "wallpaper-engine"
-                return img, pad, pad
+            r = winutil.window_rect(hwnd)
+            cx, cy = wx + ww // 2, wy + wh // 2
+            if not (r[0] <= cx < r[0] + r[2] and r[1] <= cy < r[1] + r[3]):
+                # The widget moved to another monitor; look for its surface.
+                hwnd = 0
+                self._wp_hwnd = 0
+        if not hwnd and now >= self._wp_retry:
+            hwnd = winutil.find_live_wallpaper_window(wx + ww // 2, wy + wh // 2)
+            if hwnd:
+                self._wp_hwnd = hwnd
+                logutil.log(f"wallpaper window: {hwnd}")
+            else:
+                self._wp_retry = now + 5.0
+        if hwnd:
+            rect = winutil.window_rect(hwnd)
+            region = clamp_region(*rect)
+            if region is not None:
+                img = winutil.capture_window_region(hwnd, *region)
+                if img is not None and not img.isNull() and not _is_black(img):
+                    self._backdrop_source = "wallpaper-engine"
+                    return img, wx - region[0], wy - region[1]
+                reason = "empty" if img is None or img.isNull() else "black"
+                logutil.log(
+                    f"wpe capture failed: {reason} region={region} pos=({self._win_x},{self._win_y})"
+                )
+            # Cached window stopped producing frames: look for a new one later.
+            self._wp_hwnd = 0
+            self._wp_retry = now + 5.0
 
         got = self._backdrop_from_file(w, h)
         if got is not None and not _is_black(got[0]):
             self._backdrop_source = "wallpaper-file"
             return got
 
-        img = winutil.capture_desktop_region(
-            int((self._win_x - BACKDROP_PAD) * dpr),
-            int((self._win_y - BACKDROP_PAD) * dpr),
-            int((w + BACKDROP_PAD * 2) * dpr),
-            int((h + BACKDROP_PAD * 2) * dpr),
+        geo = screen.geometry()
+        region = clamp_region(
+            int(geo.x() * dpr), int(geo.y() * dpr), int(geo.width() * dpr), int(geo.height() * dpr)
         )
-        if img is not None and not img.isNull() and not _is_black(img):
-            self._backdrop_source = "printwindow"
-            return img, pad, pad
+        if region is not None:
+            img = winutil.capture_desktop_region(*region)
+            if img is not None and not img.isNull() and not _is_black(img):
+                self._backdrop_source = "printwindow"
+                return img, wx - region[0], wy - region[1]
 
         self._backdrop_source = ""
         return None
