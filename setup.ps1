@@ -67,15 +67,34 @@ function Find-Python {
 }
 
 $python = Find-Python
-if (-not $python) {
+if (-not $python -and (Get-Command winget -ErrorAction SilentlyContinue)) {
     Write-Host "Python 3.11+ not found. Installing Python 3.13 with winget..."
-    $winget = Get-Command winget -ErrorAction SilentlyContinue
-    if ($winget) {
-        & winget install --id Python.Python.3.13 --exact --silent --accept-package-agreements --accept-source-agreements
-        $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
-            [System.Environment]::GetEnvironmentVariable("Path", "User")
-        $python = Find-Python
+    & winget install --id Python.Python.3.13 --exact --silent --accept-package-agreements --accept-source-agreements
+    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
+        [System.Environment]::GetEnvironmentVariable("Path", "User")
+    $python = Find-Python
+}
+if (-not $python) {
+    $pyVersion = "3.13.7"
+    $pyUrl = "https://www.python.org/ftp/python/$pyVersion/python-$pyVersion-amd64.exe"
+    $pyInstaller = Join-Path $env:TEMP "python-$pyVersion-amd64.exe"
+    Write-Host "Downloading Python $pyVersion from python.org..."
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        Invoke-WebRequest -Uri $pyUrl -OutFile $pyInstaller -UseBasicParsing
+        Write-Host "Installing Python $pyVersion (this may take a minute)..."
+        $proc = Start-Process -FilePath $pyInstaller -ArgumentList @(
+            "/quiet", "InstallAllUsers=1", "PrependPath=1", "Include_test=0", "Include_launcher=1"
+        ) -Wait -PassThru
+        Write-Host "Python installer exit code: $($proc.ExitCode)"
+    } catch {
+        Write-Warning "Could not download or run the Python installer: $_"
+    } finally {
+        Remove-Item $pyInstaller -Force -ErrorAction SilentlyContinue
     }
+    $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
+        [System.Environment]::GetEnvironmentVariable("Path", "User")
+    $python = Find-Python
 }
 if (-not $python) {
     throw "Python 3.11+ could not be installed automatically. Install it from https://python.org (tick 'Add python.exe to PATH') and run setup again."
