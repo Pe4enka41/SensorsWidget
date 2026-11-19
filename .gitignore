@@ -13,3 +13,7 @@ vendor/lhm.zip
 vendor/lhm/*.pdb
 vendor/lhm/LibreHardwareMonitor.exe
 vendor/lhm/LibreHardwareMonitor.exe.config
+
+# Release build artifacts
+dist/
+_release/
