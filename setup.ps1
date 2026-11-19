@@ -23,6 +23,17 @@ if (-not (Test-Admin)) {
 
 Write-Host "== Liquid Glass Sensors: setup ==" -ForegroundColor Cyan
 
+# If UAC elevated with another administrator account, the autostart task is
+# registered for that account instead of the desktop user.
+$interactiveUser = $null
+try {
+    $interactiveUser = (Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName
+} catch { }
+if ($interactiveUser -and $interactiveUser -notlike ("*\" + $env:USERNAME)) {
+    Write-Warning "Setup runs as '$env:USERNAME', but the desktop user is '$interactiveUser'."
+    Write-Warning "Autostart (if enabled) will be registered for '$env:USERNAME'."
+}
+
 # 0. Files from the release zip carry the "downloaded from the internet" mark,
 #    which blocks the .NET sensor library. Clear it up front.
 $vendor = Join-Path $root "vendor"
@@ -90,7 +101,13 @@ if (-not $python) {
     } catch {
         Write-Warning "Could not download or run the Python installer: $_"
     } finally {
-        Remove-Item $pyInstaller -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $pyInstaller) {
+            try {
+                Remove-Item -LiteralPath $pyInstaller -Force -ErrorAction Stop
+            } catch {
+                # The Python bootstrapper may already have removed its own file.
+            }
+        }
     }
     $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
         [System.Environment]::GetEnvironmentVariable("Path", "User")
