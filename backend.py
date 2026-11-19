@@ -5,10 +5,9 @@ import os
 import time
 from collections import deque
 
-from PySide6.QtCore import Property, QObject, QRectF, Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QImage, QPainter, QPixmap
+from PySide6.QtCore import Property, QObject, Qt, QTimer, Signal, Slot
+from PySide6.QtGui import QImage
 from PySide6.QtQuick import QQuickImageProvider
-from PySide6.QtWidgets import QGraphicsBlurEffect, QGraphicsPixmapItem, QGraphicsScene
 
 import config
 import winutil
@@ -37,23 +36,19 @@ class BackdropProvider(QQuickImageProvider):
 
 
 def _blur(img: QImage, radius: int) -> QImage:
-    margin = radius * 2
-    scene = QGraphicsScene()
-    item = QGraphicsPixmapItem(QPixmap.fromImage(img))
-    effect = QGraphicsBlurEffect()
-    effect.setBlurRadius(radius)
-    effect.setBlurHints(QGraphicsBlurEffect.QualityHint)
-    item.setGraphicsEffect(effect)
-    scene.addItem(item)
-    out = QImage(
-        img.width() + margin * 2, img.height() + margin * 2, QImage.Format_ARGB32_Premultiplied
+    """Cheap frosted blur: shrink (averages pixels), then scale back up."""
+    if radius <= 1 or img.isNull():
+        return img
+    factor = max(2, int(radius))
+    small = img.scaled(
+        max(1, img.width() // factor),
+        max(1, img.height() // factor),
+        Qt.IgnoreAspectRatio,
+        Qt.SmoothTransformation,
     )
-    out.fill(0)
-    painter = QPainter(out)
-    target = QRectF(0, 0, out.width(), out.height())
-    scene.render(painter, target, target.translated(-margin, -margin))
-    painter.end()
-    return out.copy(margin, margin, img.width(), img.height())
+    return small.scaled(
+        img.width(), img.height(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation
+    )
 
 
 class Backend(QObject):
@@ -61,6 +56,9 @@ class Backend(QObject):
     fansChanged = Signal()
     stateChanged = Signal()
     menuRequested = Signal()
+    menuDismissed = Signal()
+    visibilityRequested = Signal()
+    resetRequested = Signal()
     geometryChanged = Signal()
 
     def __init__(self, parent=None):
@@ -97,6 +95,7 @@ class Backend(QObject):
         self._backdrop_rev = 0
         self._last_capture = 0.0
         self._locked = bool(self._cfg.get("locked", False))
+        self._autostart = config.autostart_enabled()
         self.provider = BackdropProvider()
         self._dark = self._detect_dark()
         self._refresh_theme()
@@ -128,6 +127,13 @@ class Backend(QObject):
     # ------------------------------------------------------------------ setup
     def start(self):
         if os.environ.get("LGS_DEMO"):
+            self._fans = [
+                {"name": "CPU Fan", "rpm": 2100, "pct": 74},
+                {"name": "Pump Fan", "rpm": 1800, "pct": 60},
+                {"name": "System Fan #1", "rpm": 900, "pct": 40},
+                {"name": "System Fan #2", "rpm": 0, "pct": 0},
+            ]
+            self.fansChanged.emit()
             self._demo_t = 0.0
             self._demo_timer = QTimer(self)
             self._demo_timer.setInterval(1000)
@@ -344,6 +350,45 @@ class Backend(QObject):
         self._cfg["locked"] = self._locked
         config.save(self._cfg)
         self.stateChanged.emit()
+
+    @Property(bool, notify=stateChanged)
+    def autostart(self):
+        return self._autostart
+
+    @Slot(bool)
+    def set_autostart(self, enabled: bool):
+        config.set_autostart(bool(enabled))
+        self._autostart = config.autostart_enabled()
+        self._cfg["autostart"] = self._autostart
+        config.save(self._cfg)
+        self.stateChanged.emit()
+
+    @Property(str, notify=stateChanged)
+    def themeMode(self):
+        return self._cfg.get("theme", "auto")
+
+    # -------------------------------------------------------------- menu calls
+    @Slot()
+    def dismiss_menu(self):
+        self.menuDismissed.emit()
+
+    @Slot()
+    def request_toggle_visibility(self):
+        self.visibilityRequested.emit()
+
+    @Slot()
+    def request_reset_position(self):
+        self.resetRequested.emit()
+
+    @Slot()
+    def restart_elevated_app(self):
+        config.restart_elevated()
+
+    @Slot()
+    def quit_app(self):
+        from PySide6.QtCore import QCoreApplication
+
+        QCoreApplication.quit()
 
     @Property(list, notify=fansChanged)
     def fans(self):

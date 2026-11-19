@@ -5,69 +5,33 @@ import os
 import sys
 
 from PySide6.QtCore import QPoint, Qt, QTimer, QUrl
-from PySide6.QtGui import (
-    QAction,
-    QActionGroup,
-    QColor,
-    QGuiApplication,
-    QIcon,
-    QLinearGradient,
-    QPainter,
-    QPen,
-    QPixmap,
-)
-from PySide6.QtNetwork import QLocalServer, QLocalSocket
+from PySide6.QtGui import QColor, QGuiApplication, QIcon
 from PySide6.QtQuick import QQuickView, QQuickWindow
-from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
-import config
 import winutil
 from backend import Backend
+from tray import TrayHost
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
-SINGLE_NAME = "LiquidGlassSensors-widget"
-
-
-def make_icon() -> QIcon:
-    pm = QPixmap(64, 64)
-    pm.fill(Qt.transparent)
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.Antialiasing)
-    grad = QLinearGradient(0, 0, 64, 64)
-    grad.setColorAt(0.0, QColor(72, 92, 106, 255))
-    grad.setColorAt(1.0, QColor(24, 31, 38, 255))
-    p.setBrush(grad)
-    p.setPen(QPen(QColor(255, 255, 255, 60), 2))
-    p.drawRoundedRect(6, 6, 52, 52, 16, 16)
-    bars = [(18, 30, "#9CD3E6"), (30, 42, "#A9D3BE"), (42, 24, "#E4C79A")]
-    for x, top, color in bars:
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(color))
-        p.drawRoundedRect(x, top, 5, 46 - top, 2.5, 2.5)
-    p.end()
-    return QIcon(pm)
 
 
 def main() -> int:
-    app = QApplication(sys.argv)
+    app = QGuiApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("LiquidGlassSensors")
-    app.setWindowIcon(make_icon())
 
-    socket = QLocalSocket()
-    socket.connectToServer(SINGLE_NAME)
-    if socket.waitForConnected(250):
-        socket.write(b"show")
-        socket.flush()
-        socket.waitForBytesWritten(250)
+    icon_path = os.path.join(ROOT, "assets", "icon.ico")
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
+
+    host = TrayHost()
+    if host.already_running:
+        host.notify_existing()
         return 0
-
-    server = QLocalServer()
-    QLocalServer.removeServer(SINGLE_NAME)
-    server.listen(SINGLE_NAME)
 
     backend = Backend()
     QQuickWindow.setDefaultAlphaBuffer(True)
+
     view = QQuickView()
     view.engine().addImageProvider("backdrop", backend.provider)
     view.setColor(QColor(0, 0, 0, 0))
@@ -84,6 +48,19 @@ def main() -> int:
     window = view
     backend.attach_window(window)
     print("stage: window attached", flush=True)
+
+    menu = QQuickView()
+    menu.setColor(QColor(0, 0, 0, 0))
+    menu.setFlags(
+        Qt.FramelessWindowHint | Qt.Tool | Qt.WindowStaysOnTopHint | Qt.NoDropShadowWindowHint
+    )
+    menu.setResizeMode(QQuickView.SizeViewToRootObject)
+    menu.rootContext().setContextProperty("backend", backend)
+    menu.setSource(QUrl.fromLocalFile(os.path.join(ROOT, "qml", "Menu.qml")))
+    if menu.status() == QQuickView.Error:
+        for err in menu.errors():
+            print("Menu error:", err.toString())
+        return 1
 
     view.show()
 
@@ -111,92 +88,48 @@ def main() -> int:
 
     view.screenChanged.connect(on_screen_changed)
 
-    menu = QMenu()
-    toggle_action = menu.addAction("Скрыть виджет")
-    menu.addSeparator()
-
-    fan_menu = menu.addMenu("Датчик кулера")
-    theme_menu = menu.addMenu("Тема")
-    theme_group = QActionGroup(menu)
-    theme_group.setExclusive(True)
-    theme_actions = {}
-    for key, label in (("auto", "Как в системе"), ("dark", "Тёмная"), ("light", "Светлая")):
-        action = QAction(label, menu)
-        action.setCheckable(True)
-        action.setChecked(backend._cfg.get("theme", "auto") == key)
-        action.triggered.connect(lambda _checked, k=key: backend.set_theme(k))
-        theme_group.addAction(action)
-        theme_menu.addAction(action)
-        theme_actions[key] = action
-
-    autostart_action = menu.addAction("Запускать с Windows")
-    autostart_action.setCheckable(True)
-    autostart_action.setChecked(config.autostart_enabled())
-    lock_action = menu.addAction("Зафиксировать положение")
-    lock_action.setCheckable(True)
-    lock_action.setChecked(backend.locked)
-    menu.addSeparator()
-    if not winutil.is_admin():
-        elevate_action = menu.addAction("Перезапустить с правами администратора")
-        elevate_action.triggered.connect(config.restart_elevated)
-    reset_action = menu.addAction("Сбросить позицию")
-    menu.addSeparator()
-    quit_action = menu.addAction("Выход")
-
-    def rebuild_fans():
-        fan_menu.clear()
-        group = QActionGroup(fan_menu)
-        group.setExclusive(True)
-        current = backend._fan_name
-        for fan in backend.fans:
-            label = fan.get("name") or "?"
-            if fan.get("rpm"):
-                label += f"  ·  {int(fan['rpm'])} rpm"
-            action = QAction(label, fan_menu)
-            action.setCheckable(True)
-            action.setChecked(fan.get("name") == current)
-            action.triggered.connect(lambda _c, n=fan.get("name"): backend.set_fan(n))
-            group.addAction(action)
-            fan_menu.addAction(action)
-        if not backend.fans:
-            fan_menu.addAction("Нет данных").setEnabled(False)
-
-    rebuild_fans()
-    backend.fansChanged.connect(rebuild_fans)
-
-    def toggle_visible():
-        window.setVisible(not window.isVisible())
-        toggle_action.setText("Скрыть виджет" if window.isVisible() else "Показать виджет")
-
-    def reset_position():
-        screen = window.screen()
-        geo = screen.geometry()
-        window.setX(geo.x() + geo.width() - window.width() - 56)
-        window.setY(geo.y() + geo.height() - window.height() - 96)
-        backend.save_position(window.x(), window.y())
-
-    def toggle_autostart(checked: bool):
-        config.set_autostart(checked)
-        backend._cfg["autostart"] = checked
-        config.save(backend._cfg)
-        QTimer.singleShot(2000, lambda: autostart_action.setChecked(config.autostart_enabled()))
-
-    toggle_action.triggered.connect(toggle_visible)
-    reset_action.triggered.connect(reset_position)
-    autostart_action.toggled.connect(toggle_autostart)
-    lock_action.toggled.connect(backend.set_locked)
-    quit_action.triggered.connect(app.quit)
-
+    # ------------------------------------------------------------------ menu
     menu_watch = QTimer()
     menu_watch.setInterval(35)
     menu_armed = False
     menu_prev_down = False
+
+    def hide_menu():
+        menu_watch.stop()
+        if menu.isVisible():
+            menu.hide()
+
+    def open_menu(x: int | None = None, y: int | None = None):
+        nonlocal menu_armed, menu_prev_down
+        if x is None or y is None:
+            x, y = winutil.cursor_pos()
+        root = menu.rootObject()
+        mw = int(root.width()) if root is not None else 246
+        mh = int(root.height()) if root is not None else 300
+        screen = QGuiApplication.screenAt(QPoint(x, y)) or QGuiApplication.primaryScreen()
+        geo = screen.availableGeometry()
+        x = min(max(x, geo.left() + 4), geo.right() - mw - 4)
+        y = min(max(y, geo.top() + 4), geo.bottom() - mh - 4)
+        menu.setPosition(x, y)
+        menu.show()
+        menu_armed = False
+        menu_prev_down = True
+        menu_watch.start()
 
     def poll_menu():
         nonlocal menu_armed, menu_prev_down
         if not menu.isVisible():
             menu_watch.stop()
             return
+        root = menu.rootObject()
+        if root is not None:
+            mh = int(root.height())
+            screen = QGuiApplication.screenAt(
+                QPoint(menu.x(), menu.y())
+            ) or QGuiApplication.primaryScreen()
+            bottom = screen.availableGeometry().bottom() - mh - 4
+            if menu.y() > bottom:
+                menu.setY(bottom)
         down = winutil.mouse_buttons_down()
         if not menu_armed:
             if not down:
@@ -206,47 +139,51 @@ def main() -> int:
         if down and not menu_prev_down:
             x, y = winutil.cursor_pos()
             if not menu.geometry().contains(x, y):
-                menu.close()
-                menu_watch.stop()
+                hide_menu()
+                return
         menu_prev_down = down
 
     menu_watch.timeout.connect(poll_menu)
+    backend.menuRequested.connect(lambda: open_menu())
+    backend.menuDismissed.connect(hide_menu)
 
-    def show_menu():
-        nonlocal menu_armed, menu_prev_down
-        menu.popup(QPoint(*winutil.cursor_pos()))
-        menu_armed = False
-        menu_prev_down = True
-        menu_watch.start()
+    # ------------------------------------------------------------- window ops
+    def toggle_visible():
+        hide_menu()
+        window.setVisible(not window.isVisible())
 
-    backend.menuRequested.connect(show_menu)
+    def show_widget():
+        hide_menu()
+        window.setVisible(True)
 
-    tray = QSystemTrayIcon(make_icon(), app)
-    tray.setToolTip("Температура CPU, кулер, GPU")
-    tray.setContextMenu(menu)
-    tray.activated.connect(
-        lambda reason: show_menu() if reason == QSystemTrayIcon.Trigger else None
-    )
-    tray.show()
+    def reset_position():
+        geo = window.screen().geometry()
+        window.setX(geo.x() + geo.width() - window.width() - 56)
+        window.setY(geo.y() + geo.height() - window.height() - 96)
+        backend.save_position(window.x(), window.y())
 
-    def on_new_connection():
-        conn = server.nextPendingConnection()
-        if conn:
-            conn.readyRead.connect(lambda: window.setVisible(True))
-            conn.disconnected.connect(conn.deleteLater)
+    backend.visibilityRequested.connect(toggle_visible)
+    backend.resetRequested.connect(reset_position)
 
-    server.newConnection.connect(on_new_connection)
+    # ------------------------------------------------------------------ tray
+    host.on_show = show_widget
+    host.on_left = toggle_visible
+    host.on_right = lambda: open_menu()
+    host.add_icon(icon_path, "Температура CPU, кулер, GPU")
 
+    # --------------------------------------------------------------- shutdown
     def shutdown():
         backend.shutdown()
-        tray.hide()
-        # Destroy the QML scene while the Python bridge is still alive so the
+        host.remove_icon()
+        # Destroy the QML scenes while the Python bridge is still alive so the
         # bindings don't evaluate against a freed object during teardown.
+        menu.setSource(QUrl())
         view.setSource(QUrl())
 
     app.aboutToQuit.connect(shutdown)
     backend.start()
 
+    # ------------------------------------------------------------- dev shots
     shot_path = os.environ.get("LGS_SHOT")
     if shot_path:
         def capture():
@@ -257,6 +194,24 @@ def main() -> int:
                 app.quit()
 
         QTimer.singleShot(int(os.environ.get("LGS_SHOT_DELAY", "4500")), capture)
+
+    menu_shot = os.environ.get("LGS_MENU_SHOT")
+    if menu_shot:
+        def capture_menu():
+            open_menu(400, 260)
+            if os.environ.get("LGS_MENU_FANS"):
+                root = menu.rootObject()
+                if root is not None:
+                    root.setProperty("fansOpen", True)
+            QTimer.singleShot(500, finish_menu_shot)
+
+        def finish_menu_shot():
+            image = menu.grabWindow()
+            image.save(menu_shot)
+            print("menu shot saved", menu_shot, image.size(), flush=True)
+            app.quit()
+
+        QTimer.singleShot(int(os.environ.get("LGS_SHOT_DELAY", "3500")), capture_menu)
 
     return app.exec()
 
