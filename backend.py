@@ -10,6 +10,7 @@ from PySide6.QtGui import QImage
 from PySide6.QtQuick import QQuickImageProvider
 
 import config
+import logutil
 import winutil
 from sensors import SensorWorker
 
@@ -49,6 +50,19 @@ def _blur(img: QImage, radius: int) -> QImage:
     return small.scaled(
         img.width(), img.height(), Qt.IgnoreAspectRatio, Qt.SmoothTransformation
     )
+
+
+def _is_black(img: QImage) -> bool:
+    """Detect a failed capture (D3D/HDR surfaces sometimes read back as black)."""
+    w, h = img.width(), img.height()
+    if w < 4 or h < 4:
+        return True
+    brightest = 0
+    for i in range(1, 6):
+        for j in range(1, 6):
+            color = img.pixelColor(w * i // 6, h * j // 6)
+            brightest = max(brightest, color.red(), color.green(), color.blue())
+    return brightest < 8
 
 
 class Backend(QObject):
@@ -93,6 +107,8 @@ class Backend(QObject):
         self._dpr = 1.0
         self._backdrop = QImage()
         self._backdrop_rev = 0
+        self._backdrop_source = ""
+        self._backdrop_logged = ""
         self._last_capture = 0.0
         self._locked = bool(self._cfg.get("locked", False))
         self._autostart = config.autostart_enabled()
@@ -440,13 +456,23 @@ class Backend(QObject):
 
         if os.environ.get("LGS_WALLPAPER"):
             grabbed = self._backdrop_from_file(w, h)
+            source = "preview-file"
         else:
-            grabbed = self._backdrop_from_screen(w, h)
+            grabbed = self._grab_backdrop(w, h)
+            source = self._backdrop_source
         if grabbed is None:
+            if self._backdrop_logged != "failed":
+                self._backdrop_logged = "failed"
+                logutil.log("backdrop: no source available")
             return
         img, ox, oy = grabbed
         if img.isNull():
             return
+        if source != self._backdrop_logged:
+            self._backdrop_logged = source
+            logutil.log(
+                f"backdrop source: {source or 'none'} {img.width()}x{img.height()}"
+            )
 
         # Blur a small copy: it is cheap enough to run every frame and the
         # linear upscale in QML hides the reduced resolution.
@@ -470,32 +496,50 @@ class Backend(QObject):
         self.provider.image = self._backdrop
         self.stateChanged.emit()
 
-    def _backdrop_from_screen(self, w: int, h: int):
-        """Grab the desktop right behind the widget.
+    def _grab_backdrop(self, w: int, h: int):
+        """Grab the desktop behind the widget, with graceful fallbacks.
 
-        Wallpaper Engine paints into its own window, so reading that window's
-        DC yields the live wallpaper without capturing the widget itself.
-        Plain Windows wallpapers fall back to the wallpaper file.
+        Order: Wallpaper Engine window (live) -> wallpaper file (static) ->
+        PrintWindow of the desktop. The last one also covers wallpapers whose
+        files are unavailable (slideshow, Spotlight, policies).
         """
         screen = self._window.screen()
-        hwnd = winutil.find_live_wallpaper_window(
-            self._win_x + w // 2, self._win_y + h // 2
-        )
-        if not hwnd:
-            return self._backdrop_from_file(w, h)
-
         dpr = screen.devicePixelRatio() or 1.0
-        img = winutil.capture_window_region(
-            hwnd,
+        pad = int(BACKDROP_PAD * dpr)
+
+        hwnd = winutil.find_live_wallpaper_window(
+            int((self._win_x + w // 2) * dpr),
+            int((self._win_y + h // 2) * dpr),
+        )
+        if hwnd:
+            img = winutil.capture_window_region(
+                hwnd,
+                int((self._win_x - BACKDROP_PAD) * dpr),
+                int((self._win_y - BACKDROP_PAD) * dpr),
+                int((w + BACKDROP_PAD * 2) * dpr),
+                int((h + BACKDROP_PAD * 2) * dpr),
+            )
+            if img is not None and not img.isNull() and not _is_black(img):
+                self._backdrop_source = "wallpaper-engine"
+                return img, pad, pad
+
+        got = self._backdrop_from_file(w, h)
+        if got is not None and not _is_black(got[0]):
+            self._backdrop_source = "wallpaper-file"
+            return got
+
+        img = winutil.capture_desktop_region(
             int((self._win_x - BACKDROP_PAD) * dpr),
             int((self._win_y - BACKDROP_PAD) * dpr),
             int((w + BACKDROP_PAD * 2) * dpr),
             int((h + BACKDROP_PAD * 2) * dpr),
         )
-        if img is None or img.isNull():
-            return self._backdrop_from_file(w, h)
-        pad = int(BACKDROP_PAD * dpr)
-        return img, pad, pad
+        if img is not None and not img.isNull() and not _is_black(img):
+            self._backdrop_source = "printwindow"
+            return img, pad, pad
+
+        self._backdrop_source = ""
+        return None
 
     def _backdrop_from_file(self, w: int, h: int):
         path = winutil.wallpaper_path()

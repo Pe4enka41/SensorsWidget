@@ -8,6 +8,8 @@ from PySide6.QtCore import QPoint, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QGuiApplication, QIcon
 from PySide6.QtQuick import QQuickView, QQuickWindow
 
+import config
+import logutil
 import winutil
 from backend import Backend
 from tray import TrayHost
@@ -20,11 +22,16 @@ def main() -> int:
     app.setQuitOnLastWindowClosed(False)
     app.setApplicationName("LiquidGlassSensors")
 
+    logutil.trim()
+    logutil.log(
+        f"start v{config.VERSION} admin={winutil.is_admin()} python={sys.version.split()[0]}"
+    )
+
     icon_path = os.path.join(ROOT, "assets", "icon.ico")
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
 
-    host = TrayHost()
+    host = TrayHost(os.environ.get("LGS_INSTANCE", "LiquidGlassSensorsHost"))
     if host.already_running:
         host.notify_existing()
         return 0
@@ -44,6 +51,7 @@ def main() -> int:
     if view.status() == QQuickView.Error:
         for err in view.errors():
             print("QML error:", err.toString())
+            logutil.log("QML error: " + err.toString())
         return 1
     window = view
     backend.attach_window(window)
@@ -60,6 +68,7 @@ def main() -> int:
     if menu.status() == QQuickView.Error:
         for err in menu.errors():
             print("Menu error:", err.toString())
+            logutil.log("Menu error: " + err.toString())
         return 1
 
     view.show()

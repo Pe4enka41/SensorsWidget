@@ -7,6 +7,8 @@ import time
 
 from PySide6.QtCore import QThread, Signal
 
+import logutil
+
 ROOT = os.path.dirname(os.path.abspath(__file__))
 LHM_DIR = os.path.join(ROOT, "vendor", "lhm")
 
@@ -35,6 +37,20 @@ def _num(value):
         return None
 
 
+def _pick_gpu(gpus: list[dict]) -> dict:
+    if not gpus:
+        return {}
+    discrete = ("rx ", "radeon pro", "geforce", "rtx", "gtx", "arc ")
+    for gpu in gpus:
+        name = (gpu.get("name") or "").lower()
+        if any(marker in name for marker in discrete):
+            return gpu
+    for gpu in gpus:
+        if gpu.get("temp") is not None:
+            return gpu
+    return gpus[0]
+
+
 class SensorWorker(QThread):
     sample = Signal(dict)
     inventory = Signal(list)
@@ -52,6 +68,7 @@ class SensorWorker(QThread):
         self._gpu_handle = None
         self._gpu_name = "GPU"
         self._last_inventory = None
+        self._logged_sensors = False
 
     # ------------------------------------------------------------------ setup
     def _init_lhm(self) -> None:
@@ -70,7 +87,7 @@ class SensorWorker(QThread):
         computer = Computer()
         computer.IsCpuEnabled = True
         computer.IsMotherboardEnabled = True
-        computer.IsGpuEnabled = False
+        computer.IsGpuEnabled = True
         computer.IsMemoryEnabled = False
         computer.IsStorageEnabled = False
         computer.IsNetworkEnabled = False
@@ -78,6 +95,7 @@ class SensorWorker(QThread):
         computer.IsPsuEnabled = False
         computer.Open()
         self._computer = computer
+        logutil.log("LHM opened (cpu, motherboard, gpu)")
 
     def _init_nvml(self) -> None:
         try:
@@ -88,39 +106,42 @@ class SensorWorker(QThread):
             self._gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
             name = pynvml.nvmlDeviceGetName(self._gpu_handle)
             self._gpu_name = name.decode() if isinstance(name, bytes) else str(name)
+            logutil.log("NVML ok: " + self._gpu_name)
         except Exception as exc:  # noqa: BLE001
             self._nvml = None
+            logutil.log(f"NVML unavailable: {exc}")
             print("NVML unavailable:", exc)
 
     # ------------------------------------------------------------------ read
     def _read_lhm(self):
         cpu_temp = cpu_load = cpu_power = cpu_clock = None
+        cpu_temps = {}
         fans = {}
         controls = {}
+        gpus = []
+        dump = []
 
         for hw in self._computer.Hardware:
             hw.Update()
             hw_type = str(hw.HardwareType)
             if hw_type == "Cpu":
-                core_temps = []
                 for s in hw.Sensors:
                     stype = str(s.SensorType)
                     value = _num(s.Value)
+                    if stype == "Temperature":
+                        dump.append(f"cpu temp '{s.Name}' = {value}")
                     if value is None:
                         continue
                     if stype == "Temperature":
-                        if s.Name == "CPU Package":
-                            cpu_temp = value
-                        elif s.Name.startswith("CPU Core #") or s.Name == "Core Max":
-                            core_temps.append(value)
+                        if "Distance" not in s.Name:
+                            cpu_temps[s.Name] = value
                     elif stype == "Load" and s.Name == "CPU Total":
                         cpu_load = value
-                    elif stype == "Power" and s.Name == "CPU Package":
-                        cpu_power = value
+                    elif stype == "Power" and cpu_power is None:
+                        if s.Name in ("CPU Package", "Package", "CPU Cores"):
+                            cpu_power = value
                     elif stype == "Clock" and s.Name == "CPU Core #1":
                         cpu_clock = value
-                if cpu_temp is None and core_temps:
-                    cpu_temp = max(core_temps)
             elif hw_type == "Motherboard":
                 for sub in hw.SubHardware:
                     sub.Update()
@@ -133,6 +154,53 @@ class SensorWorker(QThread):
                             fans[s.Name] = value
                         elif stype == "Control":
                             controls[s.Name] = value
+            elif hw_type.startswith("Gpu"):
+                gpu = {
+                    "name": hw.Name,
+                    "temp": None,
+                    "load": None,
+                    "power": None,
+                    "fan": None,
+                }
+                for s in hw.Sensors:
+                    stype = str(s.SensorType)
+                    value = _num(s.Value)
+                    if stype == "Temperature":
+                        dump.append(f"gpu temp '{s.Name}' = {value}")
+                    if value is None:
+                        continue
+                    if stype == "Temperature" and s.Name in ("GPU Core", "GPU Hot Spot"):
+                        if s.Name == "GPU Core" or gpu["temp"] is None:
+                            gpu["temp"] = value
+                    elif stype == "Load" and s.Name == "GPU Core":
+                        gpu["load"] = value
+                    elif stype == "Power":
+                        if gpu["power"] is None or "Package" in s.Name or s.Name == "GPU Power":
+                            gpu["power"] = value
+                    elif stype == "Fan" and s.Name == "GPU Fan":
+                        gpu["fan"] = value
+                gpus.append(gpu)
+
+        if not self._logged_sensors:
+            self._logged_sensors = True
+            for line in dump[:40]:
+                logutil.log("sensor " + line)
+
+        cpu_temp = cpu_temps.get("CPU Package")
+        if cpu_temp is None:
+            for key in (
+                "Core (Tctl/Tdie)",
+                "Core (Tdie)",
+                "CCD1 (Tdie)",
+                "Core Max",
+                "CPU Cores",
+                "Package",
+            ):
+                if cpu_temps.get(key) is not None:
+                    cpu_temp = cpu_temps[key]
+                    break
+        if cpu_temp is None and cpu_temps:
+            cpu_temp = max(cpu_temps.values())
 
         inventory = [
             {
@@ -159,6 +227,7 @@ class SensorWorker(QThread):
             "fan_name": chosen,
             "fan_rpm": fans.get(chosen) if chosen else None,
             "fan_pct": controls.get(chosen) if chosen else None,
+            "gpu": _pick_gpu(gpus),
         }
 
     def _read_nvml(self):
@@ -212,7 +281,21 @@ class SensorWorker(QThread):
                         "rpm": cpu["fan_rpm"],
                         "pct": cpu["fan_pct"],
                     }
+                    lhm_gpu = cpu.get("gpu") or {}
+                    if data["gpu"].get("temp") is None and lhm_gpu.get("temp") is not None:
+                        data["gpu"] = {
+                            "name": lhm_gpu.get("name") or "GPU",
+                            "temp": lhm_gpu.get("temp"),
+                            "load": lhm_gpu.get("load"),
+                            "power": lhm_gpu.get("power"),
+                            "fan": lhm_gpu.get("fan"),
+                        }
+                    else:
+                        for key in ("load", "power", "fan"):
+                            if data["gpu"].get(key) is None and lhm_gpu.get(key) is not None:
+                                data["gpu"][key] = lhm_gpu[key]
                 except Exception as exc:  # noqa: BLE001
+                    logutil.log(f"sensor read failed: {type(exc).__name__}: {exc}")
                     self.failed.emit(f"{type(exc).__name__}: {exc}")
             self.sample.emit(data)
             elapsed_ms = (time.time() - started) * 1000.0

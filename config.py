@@ -8,6 +8,7 @@ import sys
 
 APP_NAME = "LiquidGlassSensors"
 TASK_NAME = "LiquidGlassSensors"
+VERSION = "1.0.6"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 CONFIG_DIR = os.path.join(os.environ["APPDATA"], APP_NAME)
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
