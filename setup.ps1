@@ -23,6 +23,13 @@ if (-not (Test-Admin)) {
 
 Write-Host "== Liquid Glass Sensors: setup ==" -ForegroundColor Cyan
 
+# 0. Files from the release zip carry the "downloaded from the internet" mark,
+#    which blocks the .NET sensor library. Clear it up front.
+$vendor = Join-Path $root "vendor"
+if (Test-Path $vendor) {
+    Get-ChildItem $vendor -Recurse -File -ErrorAction SilentlyContinue | Unblock-File
+}
+
 # 1. Python -----------------------------------------------------------------
 $python = $null
 foreach ($candidate in @("py -3", "python")) {

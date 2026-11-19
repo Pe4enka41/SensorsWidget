@@ -11,6 +11,21 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 LHM_DIR = os.path.join(ROOT, "vendor", "lhm")
 
 
+def _unblock(folder: str) -> None:
+    """Drop the "downloaded from the internet" mark so .NET can load the DLLs."""
+    try:
+        import ctypes
+
+        for name in os.listdir(folder):
+            path = os.path.join(folder, name)
+            if os.path.isfile(path):
+                ctypes.windll.kernel32.DeleteFileW(
+                    ctypes.c_wchar_p(path + ":Zone.Identifier")
+                )
+    except Exception:
+        pass
+
+
 def _num(value):
     try:
         if value is None:
@@ -40,6 +55,7 @@ class SensorWorker(QThread):
 
     # ------------------------------------------------------------------ setup
     def _init_lhm(self) -> None:
+        _unblock(LHM_DIR)
         if LHM_DIR not in sys.path:
             sys.path.insert(0, LHM_DIR)
         try:
