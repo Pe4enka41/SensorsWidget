@@ -31,28 +31,65 @@ if (Test-Path $vendor) {
 }
 
 # 1. Python -----------------------------------------------------------------
-$python = $null
-foreach ($candidate in @("py -3", "python")) {
-    $parts = $candidate.Split(" ")
-    try {
-        $version = & $parts[0] $parts[1..($parts.Length - 1)] --version 2>$null
-        if ($LASTEXITCODE -eq 0 -and $version -match "3\.(1[1-9]|[2-9][0-9])") {
-            $python = $candidate
-            break
+function Find-Python {
+    foreach ($candidate in @(@("py", "-3"), @("python"))) {
+        try {
+            $cmdArgs = @()
+            if ($candidate.Length -gt 1) {
+                $cmdArgs = @($candidate[1..($candidate.Length - 1)])
+            }
+            $out = & $candidate[0] @cmdArgs --version 2>$null
+            if ($LASTEXITCODE -eq 0 -and "$out" -match "3\.(1[1-9]|[2-9][0-9])") {
+                return [pscustomobject]@{ Exe = $candidate[0]; Args = $cmdArgs }
+            }
+        } catch { }
+    }
+
+    $roots = @(
+        (Join-Path $env:LOCALAPPDATA "Programs\Python"),
+        $env:ProgramFiles,
+        "C:\"
+    )
+    foreach ($rootDir in $roots) {
+        if (-not $rootDir -or -not (Test-Path $rootDir)) { continue }
+        $dirs = Get-ChildItem $rootDir -Directory -Filter "Python3*" -ErrorAction SilentlyContinue |
+            Sort-Object Name -Descending
+        foreach ($dir in $dirs) {
+            $exe = Join-Path $dir.FullName "python.exe"
+            if (-not (Test-Path $exe)) { continue }
+            $out = & $exe --version 2>$null
+            if ($LASTEXITCODE -eq 0 -and "$out" -match "3\.(1[1-9]|[2-9][0-9])") {
+                return [pscustomobject]@{ Exe = $exe; Args = @() }
+            }
         }
-    } catch { }
+    }
+    return $null
+}
+
+$python = Find-Python
+if (-not $python) {
+    Write-Host "Python 3.11+ not found. Installing Python 3.13 with winget..."
+    $winget = Get-Command winget -ErrorAction SilentlyContinue
+    if ($winget) {
+        & winget install --id Python.Python.3.13 --exact --silent --accept-package-agreements --accept-source-agreements
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
+            [System.Environment]::GetEnvironmentVariable("Path", "User")
+        $python = Find-Python
+    }
 }
 if (-not $python) {
-    throw "Python 3.11+ was not found. Install it from https://python.org and run setup again."
+    throw "Python 3.11+ could not be installed automatically. Install it from https://python.org (tick 'Add python.exe to PATH') and run setup again."
 }
-Write-Host "Python: $(& $python.Split(' ')[0] --version)"
+$pythonExe = $python.Exe
+$pythonArgs = @($python.Args)
+Write-Host "Python: $(& $pythonExe @pythonArgs --version)"
 
 # 2. Virtual environment ----------------------------------------------------
 $venv = Join-Path $root ".venv"
 $venvPython = Join-Path $venv "Scripts\python.exe"
 if (-not (Test-Path $venvPython)) {
     Write-Host "Creating virtual environment..."
-    & $python.Split(" ")[0] -m venv $venv
+    & $pythonExe @pythonArgs -m venv $venv
 }
 & $venvPython -m pip install --upgrade pip --quiet
 Write-Host "Installing dependencies..."
