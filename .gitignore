@@ -1,0 +1,15 @@
+﻿# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Runtime cache (blurred wallpaper frames)
+cache/
+
+# Third-party archive (the unpacked folder in vendor/lhm is used instead)
+vendor/lhm.zip
+
+# Not used at runtime: the LibreHardwareMonitor GUI and debug symbols
+vendor/lhm/*.pdb
+vendor/lhm/LibreHardwareMonitor.exe
+vendor/lhm/LibreHardwareMonitor.exe.config
