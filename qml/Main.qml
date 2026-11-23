@@ -36,7 +36,7 @@ Item {
         property var srcTex: ShaderEffectSource {
             sourceItem: wallImage
             sourceRect: Qt.rect(0, 0, Math.max(1, root.width), Math.max(1, root.height))
-            live: true
+            live: false
             hideSource: true
             recursive: false
         }

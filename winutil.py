@@ -269,11 +269,27 @@ def capture_desktop_region(x: int, y: int, w: int, h: int):
     return img
 
 
-def find_live_wallpaper_window(x: int, y: int) -> int:
-    """Find a Wallpaper Engine surface that covers the given screen point."""
+def find_live_wallpaper_windows(x: int, y: int) -> list[int]:
+    """All Wallpaper Engine surfaces covering a screen point, smallest first."""
+    found = []
+    for area, hwnd, rect in _wallpaper_surfaces():
+        if rect[0] <= x < rect[0] + rect[2] and rect[1] <= y < rect[1] + rect[3]:
+            found.append((area, hwnd))
+    found.sort()
+    return [hwnd for _, hwnd in found]
+
+
+def all_live_wallpaper_windows() -> list[int]:
+    """Every Wallpaper Engine surface, largest first."""
+    surfaces = sorted(_wallpaper_surfaces(), reverse=True)
+    return [hwnd for _, hwnd, _ in surfaces]
+
+
+def _wallpaper_surfaces():
+    """Enumerate visible Wallpaper Engine windows as (area, hwnd, rect)."""
     desktop = user32.GetDesktopWindow()
     if not desktop:
-        return 0
+        return []
 
     found = []
 
@@ -287,18 +303,20 @@ def find_live_wallpaper_window(x: int, y: int) -> int:
         w, h = rect.right - rect.left, rect.bottom - rect.top
         if w < 64 or h < 64:
             return True
-        if rect.left <= x < rect.right and rect.top <= y < rect.bottom:
-            found.append((w * h, hwnd))
+        found.append((w * h, hwnd, (rect.left, rect.top, w, h)))
         return True
 
     # EnumChildWindows on the desktop walks every top-level window and all of
     # its descendants, which covers both the Windows 11 layout (WPE under
     # Progman) and Windows 10 (WPE under a top-level WorkerW).
     user32.EnumChildWindows(desktop, ctypes.cast(cb, ctypes.c_void_p), 0)
-    if not found:
-        return 0
-    found.sort()
-    return found[0][1]
+    return found
+
+
+def find_live_wallpaper_window(x: int, y: int) -> int:
+    """Find a Wallpaper Engine surface that covers the given screen point."""
+    windows = find_live_wallpaper_windows(x, y)
+    return windows[0] if windows else 0
 
 
 def capture_window_region(hwnd: int, x: int, y: int, w: int, h: int):

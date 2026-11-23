@@ -69,6 +69,10 @@ class SensorWorker(QThread):
         self._gpu_name = "GPU"
         self._last_inventory = None
         self._logged_sensors = False
+        self._fan_cache = {}
+        self._ctrl_cache = {}
+        self._last_slow = 0.0
+        self._use_lhm_gpu = True
 
     # ------------------------------------------------------------------ setup
     def _init_lhm(self) -> None:
@@ -113,17 +117,21 @@ class SensorWorker(QThread):
             print("NVML unavailable:", exc)
 
     # ------------------------------------------------------------------ read
-    def _read_lhm(self):
+    def _read_lhm(self, slow: bool = True):
         cpu_temp = cpu_load = cpu_power = cpu_clock = None
         cpu_temps = {}
-        fans = {}
-        controls = {}
         gpus = []
         dump = []
 
         for hw in self._computer.Hardware:
-            hw.Update()
             hw_type = str(hw.HardwareType)
+            # NVML already reports NVIDIA cards; reading them twice wastes CPU.
+            if hw_type.startswith("Gpu") and not self._use_lhm_gpu:
+                continue
+            # Fans and voltages change slowly: refresh them every few seconds.
+            if hw_type == "Motherboard" and not slow:
+                continue
+            hw.Update()
             if hw_type == "Cpu":
                 for s in hw.Sensors:
                     stype = str(s.SensorType)
@@ -151,9 +159,9 @@ class SensorWorker(QThread):
                         if value is None:
                             continue
                         if stype == "Fan":
-                            fans[s.Name] = value
+                            self._fan_cache[s.Name] = value
                         elif stype == "Control":
-                            controls[s.Name] = value
+                            self._ctrl_cache[s.Name] = value
             elif hw_type.startswith("Gpu"):
                 gpu = {
                     "name": hw.Name,
@@ -205,18 +213,20 @@ class SensorWorker(QThread):
         inventory = [
             {
                 "name": name,
-                "rpm": fans.get(name),
-                "pct": controls.get(name),
+                "rpm": self._fan_cache.get(name),
+                "pct": self._ctrl_cache.get(name),
             }
-            for name in sorted(set(fans) | set(controls))
+            for name in sorted(set(self._fan_cache) | set(self._ctrl_cache))
         ]
         if inventory != self._last_inventory:
             self._last_inventory = inventory
             self.inventory.emit(inventory)
 
         chosen = self.fan_name
-        if chosen not in fans and chosen not in controls:
-            spinning = [n for n, rpm in fans.items() if rpm and rpm > 0]
+        if chosen not in self._fan_cache and chosen not in self._ctrl_cache:
+            spinning = [
+                n for n, rpm in self._fan_cache.items() if rpm and rpm > 0
+            ]
             chosen = spinning[0] if spinning else (inventory[0]["name"] if inventory else None)
 
         return {
@@ -225,8 +235,8 @@ class SensorWorker(QThread):
             "power": cpu_power,
             "clock": cpu_clock,
             "fan_name": chosen,
-            "fan_rpm": fans.get(chosen) if chosen else None,
-            "fan_pct": controls.get(chosen) if chosen else None,
+            "fan_rpm": self._fan_cache.get(chosen) if chosen else None,
+            "fan_pct": self._ctrl_cache.get(chosen) if chosen else None,
             "gpu": _pick_gpu(gpus),
         }
 
@@ -262,14 +272,18 @@ class SensorWorker(QThread):
             self.failed.emit(self._lhm_error)
 
         self._init_nvml()
+        self._use_lhm_gpu = self._nvml is None
         self.ready.emit()
 
         while not self._stop:
             started = time.time()
+            slow = started - self._last_slow >= 3.0
+            if slow:
+                self._last_slow = started
             data = {"ts": started, "gpu": self._read_nvml(), "cpu": {}, "fan": {}}
             if self._computer is not None:
                 try:
-                    cpu = self._read_lhm()
+                    cpu = self._read_lhm(slow)
                     data["cpu"] = {
                         "temp": cpu["temp"],
                         "load": cpu["load"],

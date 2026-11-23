@@ -19,6 +19,8 @@ HISTORY = 48
 BACKDROP_PAD = 80
 BLUR_RADIUS = 26.0
 BACKDROP_DOWNSCALE = 3
+# A static wallpaper only needs to be re-read when something actually changes.
+STATIC_REFRESH = 5.0
 
 
 class BackdropProvider(QQuickImageProvider):
@@ -110,7 +112,11 @@ class Backend(QObject):
         self._backdrop_source = ""
         self._backdrop_logged = ""
         self._wp_hwnd = 0
+        self._wp_mirror = 0
         self._wp_retry = 0.0
+        self._wall_key = None
+        self._wall_image = None
+        self._static_geom = None
         self._last_capture = 0.0
         self._locked = bool(self._cfg.get("locked", False))
         self._autostart = config.autostart_enabled()
@@ -441,13 +447,18 @@ class Backend(QObject):
         self._wp_w, self._wp_h = w, h
         self._dpr = dpr or 1.0
         self._wp_hwnd = 0
+        self._wp_mirror = 0
         self._wp_retry = 0.0
+        self._last_capture = 0.0
         self.refresh_backdrop()
 
     @Slot()
     def refresh_backdrop(self):
         """Capture what is really behind the widget and blur it for the glass."""
         if not self._window:
+            return
+        if not self._window.isVisible():
+            # Hidden to the tray: nothing to paint, so do not capture either.
             return
         self._sync_geometry()
         w, h = self._window.width(), self._window.height()
@@ -456,7 +467,17 @@ class Backend(QObject):
         now = time.monotonic()
         if self._backdrop_rev > 0 and now - self._last_capture < 0.04:
             return
+        geom = (self._win_x, self._win_y, w, h)
+        static = self._backdrop_source in ("wallpaper-file", "printwindow")
+        if (
+            static
+            and self._backdrop_rev > 0
+            and geom == self._static_geom
+            and now - self._last_capture < STATIC_REFRESH
+        ):
+            return
         self._last_capture = now
+        self._static_geom = geom
 
         if os.environ.get("LGS_WALLPAPER"):
             grabbed = self._backdrop_from_file(w, h)
@@ -525,19 +546,20 @@ class Backend(QObject):
             return x0, y0, x1 - x0, y1 - y0
 
         now = time.monotonic()
+        cx, cy = wx + ww // 2, wy + wh // 2
         hwnd = self._wp_hwnd
         if hwnd and not winutil.is_window(hwnd):
             hwnd = 0
             self._wp_hwnd = 0
         if hwnd:
             r = winutil.window_rect(hwnd)
-            cx, cy = wx + ww // 2, wy + wh // 2
             if not (r[0] <= cx < r[0] + r[2] and r[1] <= cy < r[1] + r[3]):
                 # The widget moved to another monitor; look for its surface.
                 hwnd = 0
                 self._wp_hwnd = 0
+                self._wp_mirror = 0
         if not hwnd and now >= self._wp_retry:
-            hwnd = winutil.find_live_wallpaper_window(wx + ww // 2, wy + wh // 2)
+            hwnd = winutil.find_live_wallpaper_window(cx, cy)
             if hwnd:
                 self._wp_hwnd = hwnd
                 logutil.log(f"wallpaper window: {hwnd}")
@@ -547,16 +569,35 @@ class Backend(QObject):
             rect = winutil.window_rect(hwnd)
             region = clamp_region(*rect)
             if region is not None:
+                if self._wp_mirror and winutil.is_window(self._wp_mirror):
+                    img = self._capture_mirror(self._wp_mirror, rect, region)
+                    if img is not None:
+                        self._backdrop_source = "wallpaper-engine"
+                        return img, wx - region[0], wy - region[1]
+                    self._wp_mirror = 0
+
                 img = winutil.capture_window_region(hwnd, *region)
                 if img is not None and not img.isNull() and not _is_black(img):
                     self._backdrop_source = "wallpaper-engine"
                     return img, wx - region[0], wy - region[1]
-                reason = "empty" if img is None or img.isNull() else "black"
+
+                # Secondary-monitor clone views are not readable via GDI, but
+                # they mirror the primary surface: sample the same relative area.
+                for other in winutil.all_live_wallpaper_windows():
+                    if other == hwnd:
+                        continue
+                    img = self._capture_mirror(other, rect, region)
+                    if img is not None:
+                        self._wp_mirror = other
+                        self._backdrop_source = "wallpaper-engine"
+                        return img, wx - region[0], wy - region[1]
+
                 logutil.log(
-                    f"wpe capture failed: {reason} region={region} pos=({self._win_x},{self._win_y})"
+                    f"wpe capture failed region={region} pos=({self._win_x},{self._win_y})"
                 )
             # Cached window stopped producing frames: look for a new one later.
             self._wp_hwnd = 0
+            self._wp_mirror = 0
             self._wp_retry = now + 5.0
 
         got = self._backdrop_from_file(w, h)
@@ -577,25 +618,73 @@ class Backend(QObject):
         self._backdrop_source = ""
         return None
 
-    def _backdrop_from_file(self, w: int, h: int):
-        path = winutil.wallpaper_path()
-        if not path or not os.path.exists(path):
-            return None
-        img = QImage(path)
-        if img.isNull():
-            return None
+    def _capture_mirror(self, mirror: int, rect, region):
+        """Read the same relative area from another monitor's wallpaper copy.
 
+        Secondary-monitor Wallpaper Engine views are often not readable with
+        GDI, but they mirror the primary surface, so the same part of the image
+        can be sampled from the readable window.
+        """
+        mx, my, mw, mh = winutil.window_rect(mirror)
+        if mw < 8 or mh < 8:
+            return None
+        rx = (region[0] - rect[0]) / max(1, rect[2])
+        ry = (region[1] - rect[1]) / max(1, rect[3])
+        rw = region[2] / max(1, rect[2])
+        rh = region[3] / max(1, rect[3])
+        img = winutil.capture_window_region(
+            mirror,
+            mx + int(rx * mw),
+            my + int(ry * mh),
+            max(8, int(rw * mw)),
+            max(8, int(rh * mh)),
+        )
+        if img is None or img.isNull() or _is_black(img):
+            return None
+        return img
+
+    def _wallpaper_image(self):
+        """Decode and scale the wallpaper file once, then reuse it.
+
+        Re-reading a 4K image 20 times a second was the main CPU cost on
+        machines without a live wallpaper window.
+        """
         from PySide6.QtGui import QGuiApplication
 
-        screen = self._window.screen()
-        dpr = screen.devicePixelRatio() or 1.0
-        vx = min(s.geometry().x() for s in QGuiApplication.screens())
-        vy = min(s.geometry().y() for s in QGuiApplication.screens())
-        vw = max(s.geometry().x() + s.geometry().width() for s in QGuiApplication.screens()) - vx
-        vh = max(s.geometry().y() + s.geometry().height() for s in QGuiApplication.screens()) - vy
+        path = winutil.wallpaper_path()
+        if not path or not os.path.exists(path):
+            return None, None
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            return None, None
+
+        screens = QGuiApplication.screens()
+        vx = min(s.geometry().x() for s in screens)
+        vy = min(s.geometry().y() for s in screens)
+        vw = max(s.geometry().x() + s.geometry().width() for s in screens) - vx
+        vh = max(s.geometry().y() + s.geometry().height() for s in screens) - vy
+        dpr = self._window.screen().devicePixelRatio() or 1.0
+
+        key = (path, mtime, vx, vy, vw, vh, dpr)
+        if key == self._wall_key and self._wall_image is not None:
+            return self._wall_image, (vx, vy, dpr)
+
+        img = QImage(path)
+        if img.isNull():
+            return None, None
         pw, ph = max(1, int(vw * dpr)), max(1, int(vh * dpr))
         img = img.scaled(pw, ph, Qt.KeepAspectRatioByExpanding, Qt.SmoothTransformation)
         img = img.copy((img.width() - pw) // 2, (img.height() - ph) // 2, pw, ph)
+        self._wall_key = key
+        self._wall_image = img
+        return img, (vx, vy, dpr)
+
+    def _backdrop_from_file(self, w: int, h: int):
+        img, layout = self._wallpaper_image()
+        if img is None:
+            return None
+        vx, vy, dpr = layout
 
         pad = int(BACKDROP_PAD * dpr)
         px = int((self._win_x - vx - BACKDROP_PAD) * dpr)
