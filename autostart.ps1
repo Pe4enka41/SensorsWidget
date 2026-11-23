@@ -5,7 +5,13 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $taskName = "LiquidGlassSensors"
 
 if ($Mode -eq "disable") {
-    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($task) {
+        # A task that is still running cannot always be unregistered, so switch
+        # it off first: a disabled task never starts at logon.
+        Disable-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue | Out-Null
+        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    }
     exit 0
 }
 
