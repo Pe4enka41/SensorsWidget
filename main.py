@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 from PySide6.QtCore import QPoint, Qt, QTimer, QUrl
 from PySide6.QtGui import QColor, QGuiApplication, QIcon
@@ -102,15 +103,22 @@ def main() -> int:
     menu_watch.setInterval(35)
     menu_armed = False
     menu_prev_down = False
+    menu_hidden_at = 0.0
 
     def hide_menu():
+        nonlocal menu_hidden_at
         menu_watch.stop()
+        menu_hidden_at = time.monotonic()
         if menu.isVisible():
             menu.hide()
 
     def open_menu(x: int | None = None, y: int | None = None):
         nonlocal menu_armed, menu_prev_down
         if x is None or y is None:
+            # The click that closed the menu must not fall through to the
+            # widget and open it again.
+            if time.monotonic() - menu_hidden_at < 0.2:
+                return
             x, y = winutil.cursor_pos()
         root = menu.rootObject()
         mw = int(root.width()) if root is not None else 246

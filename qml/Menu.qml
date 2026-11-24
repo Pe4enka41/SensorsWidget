@@ -1,4 +1,5 @@
 ﻿import QtQuick
+import QtQuick.Window
 
 Item {
     id: root
@@ -9,8 +10,19 @@ Item {
     property bool fansOpen: false
     property bool themeOpen: false
 
+    // Close the menu first, then run the action. Switching the theme or
+    // registering autostart can take a moment, and the menu must not stay on
+    // screen while that happens.
     function run(action) {
+        dismiss()
         action()
+    }
+
+    function dismiss() {
+        // Hide the window right here as well, so the menu disappears even if
+        // the backend signal is late or missed.
+        if (root.Window.window)
+            root.Window.window.visible = false
         backend.dismiss_menu()
     }
 
